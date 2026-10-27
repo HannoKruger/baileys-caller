@@ -66,3 +66,14 @@ test("only incoming calls can be accepted", () => {
   const call = new ActiveCall("F", fakeEngine(), fakeUplink(), "outgoing");
   assert.throws(() => call.accept(), /incoming/);
 });
+
+test("an ended call can no longer push audio into the shared uplink", () => {
+  const pushed = [];
+  const uplink = { push: (pcm) => pushed.push(pcm), flush: () => pushed.push("flush") };
+  const engine = { endCall() {}, acceptCall() {}, rejectCall() {}, setMute() {} };
+  const call = new ActiveCall("c1", engine, uplink, "incoming");
+  call._forceEnd("hangup");
+  call.pushAudio(new Float32Array(160));
+  call.flushAudio();
+  assert.deepEqual(pushed, []);
+});

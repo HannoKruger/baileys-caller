@@ -283,7 +283,9 @@ export class SignalingBridge {
         const isOffer = voipChild.tag === "offer";
         const incomingCallId = String(voipChild.attrs["call-id"] ?? voipChild.attrs.call_id ?? "");
         const callIdForRouting = incomingCallId || activeCallId;
-        if (!isOffer && activeCallId && incomingCallId && incomingCallId !== activeCallId)
+        // A second call while one is live never reaches the WASM: it keeps ringing
+        // on the account's other devices instead of disturbing the live call.
+        if (activeCallId && incomingCallId && incomingCallId !== activeCallId)
             return;
         // WhatsApp retransmits offers; the WASM must see each call's offer once.
         if (isOffer && callIdForRouting && this.#incomingCallPeerById.has(callIdForRouting))

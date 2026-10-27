@@ -122,9 +122,16 @@ export class ActiveCall extends EventEmitter {
         catch { }
     };
     /** Stream PCM to the peer. Needs `audioSource: "live"`; Float32 at the negotiated capture format, 16 kHz mono in practice. */
-    pushAudio = (pcm) => { this.uplink.push(pcm); };
+    pushAudio = (pcm) => {
+        // The uplink is shared by every call; an ended call must not feed the next one.
+        if (!this.#ended)
+            this.uplink.push(pcm);
+    };
     /** Drop queued outbound audio, e.g. when the peer starts talking over it. */
-    flushAudio = () => { this.uplink.flush(); };
+    flushAudio = () => {
+        if (!this.#ended)
+            this.uplink.flush();
+    };
     waitForEnd = () => this.#endPromise;
     /** @internal */
     _limitDuration = (durationMs) => {
@@ -413,6 +420,7 @@ export class VoipClient extends EventEmitter {
     };
     #adopt = (call) => {
         this.#activeCall = call;
+        this.#earlyUplink = [];
         call.once("ended", () => {
             if (this.#activeCall !== call)
                 return;
