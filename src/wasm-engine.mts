@@ -475,6 +475,16 @@ export class WasmEngine {
     }
   };
 
+  acceptCall = (isMicEnabled = true, isCameraEnabled = false): void => {
+    this.#ensureInitialized();
+    this.#instance.acceptCall(isMicEnabled, isCameraEnabled);
+  };
+
+  rejectCall = (): void => {
+    this.#ensureInitialized();
+    this.#instance.rejectCall();
+  };
+
   endCall = (reason = 0, sendTerminate = true): void => {
     this.#ensureInitialized();
     this.#instance.endCall(reason, sendTerminate);

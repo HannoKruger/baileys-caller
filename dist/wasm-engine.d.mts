@@ -58,6 +58,8 @@ export declare class WasmEngine {
         isFromDialer?: boolean;
         extraData?: Uint8Array;
     }) => unknown;
+    acceptCall: (isMicEnabled?: boolean, isCameraEnabled?: boolean) => void;
+    rejectCall: () => void;
     endCall: (reason?: number, sendTerminate?: boolean) => void;
     setMute: (muted: boolean) => number;
     updateNetworkMedium: (networkMedium: number, networkMtu?: number) => void;

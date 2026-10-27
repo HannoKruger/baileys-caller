@@ -21,11 +21,12 @@ export type CallOptions = {
 };
 /** Events emitted by an `ActiveCall`. */
 export type CallEvents = {
+    /** Outgoing calls only: the remote device is ringing. */
     ringing: () => void;
     connected: () => void;
     /** 16 kHz mono Float32 PCM frame from the remote peer. */
     audio: (pcm: Float32Array) => void;
-    /** Reason: `"hangup"` | `"timeout"` | `"rejected"` | `"remote_end"` | `"disconnect"` | etc. */
+    /** Reason: `"hangup"` | `"rejected"` | `"ended"` | `"disconnect"`. */
     ended: (reason: string) => void;
     error: (err: Error) => void;
 };

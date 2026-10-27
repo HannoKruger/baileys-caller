@@ -18,6 +18,7 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
+import { loadBaileys } from "./baileys.mjs";
 import { CallState, type VoipSdkConfig } from "./types.mjs";
 
 export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
@@ -25,15 +26,6 @@ export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
 
-const loadBaileys = async (): Promise<any> => {
-  try {
-    return await import("@whiskeysockets/baileys");
-  } catch {
-    throw new Error(
-      "Could not import @whiskeysockets/baileys. Install it as a peer dependency.",
-    );
-  }
-};
 
 const toBareJid = (jid: string): string => {
   if (!jid) return jid;
@@ -76,6 +68,23 @@ const isCallReceiptNode = (node: any): boolean => {
   return !!(child?.attrs?.["call-id"] || child?.attrs?.call_id);
 };
 
+/** Where an `ActiveCall` sends live audio: the uplink feeder, whichever is current. */
+type Uplink = {
+  push: (pcm: Float32Array) => void;
+  flush: () => void;
+};
+
+export type CallDirection = "outgoing" | "incoming";
+
+/** Who placed an incoming call, as read from its offer stanza. */
+export type CallPeer = {
+  /** Routing JID of the caller (usually a LID). */
+  jid: string;
+  /** Caller phone number, digits only, when WhatsApp includes it. */
+  phoneNumber?: string;
+  isVideo: boolean;
+};
+
 /** A live or recently-ended call. */
 export class ActiveCall extends EventEmitter {
   #state: CallState = CallState.Idle;
@@ -83,6 +92,7 @@ export class ActiveCall extends EventEmitter {
   readonly #endPromise: Promise<string>;
   #endTimer: NodeJS.Timeout | null = null;
   #ended = false;
+  #acceptPending = false;
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
@@ -90,37 +100,78 @@ export class ActiveCall extends EventEmitter {
   constructor(
     public readonly callId: string,
     private readonly engine: WasmEngine,
-    durationMs: number,
+    private readonly uplink: Uplink,
+    public readonly direction: CallDirection,
+    public readonly peer?: CallPeer,
   ) {
     super();
     this.#endPromise = new Promise((res) => { this.#endResolver = res; });
-    if (durationMs > 0) {
-      this.#endTimer = setTimeout(() => this.end(), durationMs);
-    }
   }
 
   get state(): CallState { return this.#state; }
 
+  /**
+   * Answer an incoming call. `audioSource` is a file, `"silence"`, or `"live"`
+   * to stream with `pushAudio()`. WhatsApp only accepts once the offer has been
+   * processed, so an early accept is held until the call reaches ReceivedCall.
+   */
+  accept = (opts: { audioSource?: string; durationMs?: number } = {}): void => {
+    if (this.direction !== "incoming") throw new Error("Only incoming calls can be accepted.");
+    if (this.#ended || this.#acceptPending) return;
+    this._audioSource = opts.audioSource ?? "silence";
+    this._limitDuration(opts.durationMs ?? 0);
+    this.#acceptPending = true;
+    if (this.#state === CallState.ReceivedCall) this.#sendAccept();
+  };
+
+  reject = (): void => {
+    if (this.direction !== "incoming" || this.#ended) return;
+    try { this.engine.rejectCall(); } catch {}
+    this._forceEnd("rejected");
+  };
+
   end = (): void => {
     if (this.#ended) return;
-    this.#ended = true;
-    if (this.#endTimer) { clearTimeout(this.#endTimer); this.#endTimer = null; }
     try { this.engine.endCall(0, true); } catch {}
+    this._forceEnd("hangup");
   };
 
   mute = (muted: boolean): void => {
     try { this.engine.setMute(muted); } catch {}
   };
 
+  /** Stream PCM to the peer. Needs `audioSource: "live"`; Float32 at the negotiated capture format, 16 kHz mono in practice. */
+  pushAudio = (pcm: Float32Array): void => { this.uplink.push(pcm); };
+
+  /** Drop queued outbound audio, e.g. when the peer starts talking over it. */
+  flushAudio = (): void => { this.uplink.flush(); };
+
   waitForEnd = (): Promise<string> => this.#endPromise;
+
+  /** @internal */
+  _limitDuration = (durationMs: number): void => {
+    if (durationMs <= 0) return;
+    if (this.#endTimer) clearTimeout(this.#endTimer);
+    this.#endTimer = setTimeout(() => this.end(), durationMs);
+  };
 
   /** @internal — called by VoipClient on WASM call-state change */
   _updateState = (state: number): void => {
     this.#state = state as CallState;
-    if (state === CallState.PreacceptReceived) this.emit("ringing");
+    if (state === CallState.ReceivedCall && this.#acceptPending) this.#sendAccept();
+    else if (state === CallState.PreacceptReceived) this.emit("ringing");
     else if (state === CallState.Active) this.emit("connected");
     else if (state === CallState.Idle || state === CallState.Ending) {
       this._forceEnd("ended");
+    }
+  };
+
+  #sendAccept = (): void => {
+    this.#acceptPending = false;
+    try {
+      this.engine.acceptCall(true, false);
+    } catch (err) {
+      this.emit("error", err instanceof Error ? err : new Error(String(err)));
     }
   };
 
@@ -137,8 +188,13 @@ export class ActiveCall extends EventEmitter {
   };
 }
 
-/** Top-level client. Connects to WhatsApp and lets you place calls. */
-export class VoipClient {
+/**
+ * Top-level client. Connects to WhatsApp, places calls, and emits `"call"`
+ * with an incoming `ActiveCall` to `accept()` or `reject()`. Emits `"qr"`
+ * with each linking code while unlinked, and `"disconnected"` when the
+ * WhatsApp socket closes after it was open.
+ */
+export class VoipClient extends EventEmitter {
   readonly #config: VoipSdkConfig;
   #engine: WasmEngine | null = null;
   #relay: RelayRtcTransport | null = null;
@@ -155,9 +211,28 @@ export class VoipClient {
   #captureFramesPerChunk = 320;
   #feeder: AudioFeeder | null = null;
 
+  // Live audio pushed after accept() but before WhatsApp starts audio
+  // capture, such as a greeting, waits here instead of being dropped.
+  #earlyUplink: Float32Array[] = [];
+
+  readonly #uplink: Uplink = {
+    push: (pcm) => {
+      if (this.#feeder) this.#feeder.push(pcm);
+      else this.#earlyUplink.push(pcm);
+    },
+    flush: () => {
+      this.#feeder?.flush();
+      this.#earlyUplink = [];
+    },
+  };
+
   constructor(config: VoipSdkConfig) {
+    super();
     this.#config = config;
   }
+
+  /** The underlying Baileys socket, e.g. to send a text message. */
+  get socket(): any { return this.#sock; }
 
   /** Connect to WhatsApp and bring up the WASM VoIP stack. */
   connect = async (): Promise<void> => {
@@ -187,28 +262,35 @@ export class VoipClient {
     });
 
     // Connect with auto-reconnect on the post-QR 515 stream-error path.
-    await new Promise<void>((resolveOpen, rejectOpen) => {
+    // Baileys can throw the 515 restart out of its socket handler, so it is
+    // caught process-wide, but only until connect() settles: left installed,
+    // the handler would swallow every later crash in the host process.
+    await new Promise<void>((resolve, reject) => {
       let opened = false;
       let retries = 0;
       const maxRetries = 5;
+
+      const onStreamError = (err: any) => {
+        const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
+        if ((code === 515 || code === "515") && retries < maxRetries) {
+          retries += 1;
+          setTimeout(connectSocket, 1500);
+        } else {
+          rejectOpen(err);
+        }
+      };
+      const settle = () => process.off("uncaughtException", onStreamError);
+      const resolveOpen = () => { settle(); resolve(); };
+      const rejectOpen = (err: unknown) => { settle(); reject(err); };
+      process.on("uncaughtException", onStreamError);
 
       const connectSocket = () => {
         this.#sock = createSocket();
         this.#sock.ev.on("creds.update", saveCreds);
 
-        process.removeAllListeners("uncaughtException");
-        process.on("uncaughtException", (err: any) => {
-          const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
-          if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
-            retries += 1;
-            setTimeout(connectSocket, 1500);
-          } else if (!opened) {
-            rejectOpen(err);
-          }
-        });
-
         this.#sock.ev.on("connection.update", (update: any) => {
           if (update.qr) {
+            this.emit("qr", update.qr);
             void import("qrcode-terminal")
               .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
               .catch(() => {
@@ -218,8 +300,11 @@ export class VoipClient {
           }
           if (update.connection === "open") {
             opened = true;
-            process.removeAllListeners("uncaughtException");
             resolveOpen();
+            return;
+          }
+          if (update.connection === "close" && opened) {
+            this.emit("disconnected", update.lastDisconnect?.error);
             return;
           }
           if (update.connection === "close" && !opened) {
@@ -272,6 +357,7 @@ export class VoipClient {
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
     this.#sock.ws.on("CB:call", (node: any) => {
+      this.#trackIncomingOffer(node);
       this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
     });
     this.#sock.ws.on("CB:receipt", (node: any) => {
@@ -312,9 +398,10 @@ export class VoipClient {
 
     const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
 
-    const call = new ActiveCall(callId, this.#engine, durationMs);
+    const call = new ActiveCall(callId, this.#engine, this.#uplink, "outgoing");
     call._audioSource = audioSource;
-    this.#activeCall = call;
+    call._limitDuration(durationMs);
+    this.#adopt(call);
 
     this.#engine.startCall({
       peerJid: peerLid,
@@ -345,6 +432,37 @@ export class VoipClient {
 
   // ─── private ──────────────────────────────────────────────────────────────
 
+  /**
+   * Register an incoming offer as the active call before the signaling bridge
+   * feeds it to WASM, so the ReceivedCall state change has a call to land on.
+   * Offline offers are calls that rang while we were disconnected; a second
+   * offer during a call is left ringing on the user's other devices.
+   */
+  #trackIncomingOffer = (node: any): void => {
+    const offer = Array.isArray(node?.content) ? node.content[0] : null;
+    if (offer?.tag !== "offer" || node.attrs?.offline) return;
+    const callId = String(offer.attrs?.["call-id"] ?? "");
+    if (!callId || this.#activeCall || !this.#engine) return;
+
+    const isVideo = Array.isArray(offer.content) && offer.content.some((child: any) => child?.tag === "video");
+    const call = new ActiveCall(callId, this.#engine, this.#uplink, "incoming", {
+      jid: String(node.attrs.from ?? offer.attrs["call-creator"] ?? ""),
+      phoneNumber: String(offer.attrs.caller_pn ?? "").split("@")[0].split(":")[0] || undefined,
+      isVideo,
+    });
+    this.#adopt(call);
+    this.emit("call", call);
+  };
+
+  #adopt = (call: ActiveCall): void => {
+    this.#activeCall = call;
+    call.once("ended", () => {
+      if (this.#activeCall !== call) return;
+      this.#activeCall = null;
+      this.#earlyUplink = [];
+    });
+  };
+
   #handleCallEvent = (eventType: number, eventData?: string): void => {
     if (eventType === 16 && eventData) {
       try {
@@ -358,8 +476,6 @@ export class VoipClient {
         const update = JSON.parse(eventData) as RelayListUpdatePayload;
         this.#relay?.updateRelayList(update);
       } catch {}
-    } else if (eventType === 2) {
-      this.#activeCall?._forceEnd("remote_end");
     }
   };
 
@@ -388,6 +504,8 @@ export class VoipClient {
       audioSource,
     );
     this.#feeder.start();
+    if (this.#feeder.isLive) this.#earlyUplink.forEach((pcm) => this.#feeder!.push(pcm));
+    this.#earlyUplink = [];
   };
 
   #handleAudioCaptureStop = (): void => {

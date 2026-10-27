@@ -1,12 +1,3 @@
-/**
- * Signaling bridge.
- *
- * Glues the WASM VoIP stack to Baileys: encrypts outbound `offer` / `enc_rekey`
- * stanzas, decrypts inbound ones, manages TC tokens, multi-device JID routing,
- * and signal-session refresh.
- *
- * @author ShellTear
- */
 export type BaileysSocket = {
     authState: any;
     signalRepository: any;

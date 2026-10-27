@@ -4,17 +4,18 @@ Place WhatsApp voice calls from Node.js.
 
 Wraps WhatsApp Web's official VoIP WASM stack and uses [Baileys](https://github.com/WhiskeySockets/Baileys) for authentication and signaling. Audio (MP3, WAV, or `Float32Array`) is encoded with Opus and sent over the live RTP session.
 
-> **Author:** ShellTear
+> **Author:** ShellTear. This fork adds answering incoming calls and streaming
+> live audio out, so an AI agent can hold a conversation on a call.
 
 ## Status
 
 - ✅ Outbound 1:1 voice calls
-- ✅ Stream audio from MP3/WAV files
+- ✅ Inbound 1:1 voice calls (accept / reject)
+- ✅ Stream audio from MP3/WAV files, or live with `pushAudio()`
 - ✅ Receive remote audio as `Float32Array`
 - ✅ Mute / unmute / hang up
 - ❌ Group calls
 - ❌ Video
-- ❌ Inbound calls
 
 ## Requirements
 
@@ -44,7 +45,7 @@ You can also depend on it from another project via a git URL in `package.json`:
 }
 ```
 
-`@whiskeysockets/baileys` is a peer dependency — install it in your project alongside this one.
+Baileys is a peer dependency. Install `baileys` or `@whiskeysockets/baileys` in your project alongside this one.
 
 ## Quick Start
 
@@ -68,10 +69,21 @@ await call.waitForEnd();
 client.disconnect();
 ```
 
-Run the bundled example from a clone:
+### Answering calls
+
+```ts
+client.on("call", (call) => {
+  if (call.peer?.phoneNumber !== "12345678901") return; // leave it ringing
+  call.accept({ audioSource: "live" });
+  call.on("audio", (pcm) => call.pushAudio(pcm)); // echo the caller back
+});
+```
+
+Run the bundled examples from a clone:
 
 ```bash
 npx tsx examples/call.mts ./auth 12345678901 ./hello.mp3
+npx tsx examples/answer.mts ./auth 12345678901   # echoes the caller back
 ```
 
 ## API
@@ -95,6 +107,20 @@ Places an outbound call. `phoneNumber` is digits only (e.g. `"12345678901"`).
 | `audioSource` | `string \| "silence"` | Path to MP3/WAV, or `"silence"` for an empty stream      |
 | `durationMs`  | `number?`             | Auto-hangup after N ms                                   |
 
+### `client.on("call", (call: ActiveCall) => ...)`
+
+An incoming voice call. `call.peer` has the caller's `jid`, `phoneNumber`
+(when WhatsApp sends it) and `isVideo`. Ignore the call to leave it ringing on
+your other devices.
+
+### `client.on("disconnected", (error) => ...)`
+
+The WhatsApp socket closed after it was open. Reconnect by restarting.
+
+### `client.socket`
+
+The underlying Baileys socket, e.g. for `sendMessage`.
+
 ### `client.disconnect(): void`
 
 Closes the WhatsApp socket and releases resources.
@@ -107,14 +133,18 @@ Returned by `client.call()`. Extends `EventEmitter`.
 
 | Event       | Payload         | When                                          |
 |-------------|-----------------|-----------------------------------------------|
-| `ringing`   | —               | Remote device is ringing                      |
+| `ringing`   | —               | Outgoing only: remote device is ringing       |
 | `connected` | —               | Call answered, media flowing                  |
 | `audio`     | `Float32Array`  | 16 kHz mono PCM frame from the remote peer    |
-| `ended`     | `string`        | Call ended (`hangup`, `timeout`, `rejected`)  |
+| `ended`     | `string`        | `hangup`, `rejected`, `ended`, `disconnect`   |
 | `error`     | `Error`         | Fatal error                                   |
 
 #### Methods
 
+- `call.accept({ audioSource?, durationMs? }): void` — answer an incoming call. `audioSource` is a file, `"silence"`, or `"live"`
+- `call.reject(): void` — decline an incoming call
+- `call.pushAudio(pcm: Float32Array): void` — stream live audio (16 kHz mono, needs `audioSource: "live"`)
+- `call.flushAudio(): void` — drop queued live audio, e.g. on barge-in
 - `call.end(): void` — hang up
 - `call.mute(muted: boolean): void` — toggle outgoing mute
 - `call.waitForEnd(): Promise<string>` — resolves with end reason
@@ -122,6 +152,8 @@ Returned by `client.call()`. Extends `EventEmitter`.
 #### Properties
 
 - `call.callId: string`
+- `call.direction: "outgoing" | "incoming"`
+- `call.peer?: { jid, phoneNumber?, isVideo }` — incoming calls
 
 ## How it works
 

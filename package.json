@@ -1,6 +1,6 @@
 {
   "name": "baileys-caller",
-  "version": "0.1.0",
+  "version": "0.1.0-homelab.1",
   "description": "WhatsApp voice calling SDK for Node.js. Built on Baileys, audio via WhatsApp Web's WASM stack.",
   "author": "ShellTear",
   "private": true,
@@ -24,14 +24,24 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
     "example": "tsx examples/call.mts",
-    "fetch-wasm": "node scripts/fetch-wasm-resources.mjs"
+    "fetch-wasm": "node scripts/fetch-wasm-resources.mjs",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
     "@roamhq/wrtc": "^0.10.0",
     "qrcode-terminal": "^0.12.0"
   },
   "peerDependencies": {
+    "baileys": "^7.0.0-rc11",
     "@whiskeysockets/baileys": "^7.0.0-rc11"
+  },
+  "peerDependenciesMeta": {
+    "baileys": {
+      "optional": true
+    },
+    "@whiskeysockets/baileys": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -7,6 +7,7 @@
  *
  * @author ShellTear
  */
+import { loadBaileys } from "./baileys.mjs";
 
 export type BaileysSocket = {
   authState: any;
@@ -26,23 +27,16 @@ export type SignalingBridgeConfig = {
 };
 
 const S_WHATSAPP_NET = "@s.whatsapp.net";
+
+// The queues must survive one bad stanza, but a call that silently never
+// connects is undebuggable, so failures are reported rather than dropped.
+const reportFailure = (step: string) => (error: unknown): void => {
+  console.error(`[baileys-caller] could not ${step}:`, error);
+};
 const TC_TOKEN_REQUEST_TIMEOUT_MS = 3500;
 const SESSION_CACHE_TTL_MS = 5 * 60_000;
 const ACK_TIMEOUT_MS = 15_000;
 
-let _baileysModule: any = null;
-
-const loadBaileys = async (): Promise<any> => {
-  if (_baileysModule) return _baileysModule;
-  try {
-    _baileysModule = await import("@whiskeysockets/baileys");
-    return _baileysModule;
-  } catch {
-    throw new Error(
-      "Could not import @whiskeysockets/baileys. Install it as a peer dependency.",
-    );
-  }
-};
 
 const getNodeChildren = (node: any): any[] =>
   Array.isArray(node.content) ? node.content : [];
@@ -112,19 +106,19 @@ export class SignalingBridge {
   sendSignaling = (peerJid: string, callId: string, xmlPayload: Uint8Array): void => {
     this.#outgoingSignalingQueue = this.#outgoingSignalingQueue
       .then(() => this.#doSendSignaling(peerJid, callId, xmlPayload))
-      .catch(() => {});
+      .catch(reportFailure("send call signaling"));
   };
 
   processIncomingCall = (node: any, voip: any, activeCallId: string): void => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
-      .catch(() => {});
+      .catch(reportFailure("process incoming call signaling"));
   };
 
   processIncomingReceipt = (node: any, voip: any, activeCallId: string): void => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingReceipt(node, voip, activeCallId))
-      .catch(() => {});
+      .catch(reportFailure("process call receipt"));
   };
 
   requestTcToken = async (jid: string): Promise<Uint8Array | undefined> => {
@@ -338,9 +332,12 @@ export class SignalingBridge {
     const voipChild = getAllBinaryNodeChildren(node)[0];
     if (!voipChild) return;
 
+    const isOffer = voipChild.tag === "offer";
     const incomingCallId = String(voipChild.attrs["call-id"] ?? voipChild.attrs.call_id ?? "");
     const callIdForRouting = incomingCallId || activeCallId;
-    if (activeCallId && incomingCallId && incomingCallId !== activeCallId) return;
+    if (!isOffer && activeCallId && incomingCallId && incomingCallId !== activeCallId) return;
+    // WhatsApp retransmits offers; the WASM must see each call's offer once.
+    if (isOffer && callIdForRouting && this.#incomingCallPeerById.has(callIdForRouting)) return;
 
     const senderDeviceJid =
       String(voipChild.attrs.participant ?? "") ||
@@ -358,6 +355,7 @@ export class SignalingBridge {
     if (getBinaryNodeChild(voipChild, "enc")) {
       usableNode = await this.#maybeDecryptEnc(voipChild, senderDeviceJid);
     }
+    if (isOffer) this.#normalizeOfferDeviceJids(usableNode);
 
     const b64 = Buffer.from(encodeBinaryNode(usableNode)).toString("base64");
 
@@ -381,14 +379,20 @@ export class SignalingBridge {
       this.#incomingCallPeerById.set(callIdForRouting, routedPeerJid);
     }
 
-    const tcToken = await this.ensureTcToken(routedPeerJid, callbackPeerJid);
+    // An offer must reach the WASM before the caller gives up ringing, so it
+    // only uses tokens already stored instead of querying the server.
+    const tcToken = isOffer
+      ? (await this.#getTcToken(routedPeerJid)) ?? (await this.#getTcToken(callbackPeerJid))
+      : await this.ensureTcToken(routedPeerJid, callbackPeerJid);
 
     switch (usableNode.tag) {
       case "offer":
+        // Platform is a name such as "android"; as a number it became NaN
+        // and the WASM silently dropped the offer.
         voip.handleSignalingOffer({
           payload: b64,
-          peerPlatform: Number(platform || 0),
-          peerAppVersion: appVersion,
+          peerPlatform: String(platform),
+          peerAppVersion: String(appVersion),
           epochId, timestamp,
           isOffline: offline,
           isOfferNotContact: false,
@@ -454,7 +458,12 @@ export class SignalingBridge {
     const type = enc.attrs.type;
     if (type !== "pkmsg" && type !== "msg") return voipNode;
 
-    const candidates = [...new Set([peerJid, this.#toCallDeviceJid(peerJid)])].filter(Boolean);
+    const candidates = [...new Set([
+      peerJid,
+      this.#toCallDeviceJid(peerJid),
+      this.#toPrimaryDeviceJid(peerJid),
+      this.#toBareJid(peerJid),
+    ])].filter(Boolean);
     let lastErr: unknown;
     for (const jid of candidates) {
       try {
@@ -467,6 +476,13 @@ export class SignalingBridge {
           throw new Error("decrypted signaling has no call.callKey");
         }
         enc.content = callKey;
+        // The WASM treats the key as already decrypted only when typed "msg",
+        // and <encopt> is an HMAC over the original ciphertext: left in place
+        // it fails offer verification with CallOfferAckCorrupt.
+        enc.attrs.type = "msg";
+        if (Array.isArray(voipNode.content)) {
+          voipNode.content = voipNode.content.filter((child: any) => child?.tag !== "encopt");
+        }
         return voipNode;
       } catch (err) {
         lastErr = err;
@@ -553,6 +569,22 @@ export class SignalingBridge {
   };
 
   // ─── private — JID utilities ──────────────────────────────────────────────
+
+  /**
+   * The WASM ignores an offer unless its creator matches the peer it is given.
+   * A bare "user@lid" encodes as a JID pair, which the WASM reads back as a
+   * phone-number JID; with an explicit device ("user:0@lid") it encodes as a
+   * device JID that keeps its LID domain.
+   */
+  #normalizeOfferDeviceJids = (offer: any): void => {
+    const { jidDecode } = this.#baileys;
+    for (const attribute of ["call-creator", "participant"]) {
+      const jid = String(offer.attrs[attribute] ?? "");
+      const decoded = jid ? jidDecode(jid) : undefined;
+      if (!decoded?.user) continue;
+      offer.attrs[attribute] = `${decoded.user}:${decoded.device ?? 0}@${decoded.server}`;
+    }
+  };
 
   #toBareJid = (jid: string): string => {
     const { jidDecode, jidEncode } = this.#baileys;
